@@ -1,0 +1,389 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>inkscreen</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            background: #f2f4f7;
+            margin: 0;
+            padding: 16px;
+            color: #222
+        }
+
+        h1 {
+            font-size: 20px;
+            margin: 0 0 4px
+        }
+
+        .ip {
+            font-size: 13px;
+            color: #888;
+            font-weight: normal
+        }
+
+        .card {
+            background: #fff;
+            border-radius: 12px;
+            padding: 16px;
+            margin-bottom: 14px;
+            box-shadow: 0 1px 4px rgba(0, 0, 0, .12)
+        }
+
+        .card h2 {
+            font-size: 16px;
+            margin: 0 0 8px
+        }
+
+        .row {
+            display: flex;
+            gap: 8px;
+            margin-top: 12px
+        }
+
+        button {
+            flex: 1;
+            padding: 11px;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            color: #fff;
+            cursor: pointer
+        }
+
+        .ok {
+            background: #1a73e8
+        }
+
+        .gray {
+            background: #6b7280
+        }
+
+        .red {
+            background: #d93025
+        }
+
+        .ota {
+            background: #0d8a3e
+        }
+
+        select {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 9px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            font-size: 15px;
+            margin-top: 8px
+        }
+
+        input[type=file] {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 8px;
+            border: 1px solid #ccc;
+            border-radius: 8px
+        }
+
+        canvas {
+            display: block;
+            margin: 10px auto;
+            border: 1px solid #ddd;
+            image-rendering: pixelated;
+            background: #fff;
+            max-width: 100%
+        }
+
+        .info {
+            font-size: 13px;
+            color: #555;
+            line-height: 1.7;
+            margin-top: 8px
+        }
+
+        .note {
+            font-size: 12px;
+            color: #999;
+            margin-top: 6px
+        }
+
+        #logBox {
+            background: #101418;
+            color: #7CFC98;
+            font: 11px/1.5 Consolas, Menlo, monospace;
+            padding: 10px;
+            border-radius: 8px;
+            max-height: 240px;
+            overflow: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+            margin-top: 10px
+        }
+    </style>
+</head>
+
+<body>
+    <h1>inkscreen <span class="ip" id="ip"></span></h1>
+    <div class="card">
+        <div class="info" id="status">加载中...</div>
+    </div>
+    <div class="card">
+        <h2>上传图片显示</h2>
+        <input type="file" id="file" accept="image/*">
+        <canvas id="preview"></canvas>
+        <select id="methodSel" onchange="reprocess()">
+            <option value="fs">Floyd–Steinberg 抖动</option>
+            <option value="simple">简单填充（最近色）</option>
+        </select>
+        <div class="row"><button class="ok" onclick="uploadImage()">上传并显示</button></div>
+        <div class="note" id="sizeNote">尺寸取自当前屏幕型号。</div>
+    </div>
+    <div class="card">
+        <h2>屏幕型号</h2>
+        <select id="screenSel" style="width:100%;box-sizing:border-box;padding:9px;border:1px solid #ccc;border-radius:8px;font-size:15px"></select>
+        <div class="row"><button class="ok" onclick="saveScreen()">保存并应用</button></div>
+        <div class="info" id="modelInfo">加载中...</div>
+    </div>
+    <div class="card">
+        <h2>测试</h2>
+        <div class="row">
+            <button class="gray" onclick="post('/test')">测试图案</button>
+            <button class="red" onclick="post('/clear')">清屏</button>
+        </div>
+    </div>
+    <div class="card">
+        <h2>设备日志 <span class="note">自动刷新 · 排查屏幕/驱动用（与串口输出同步）</span></h2>
+        <div class="row">
+            <button class="gray" onclick="toggleLog()" id="logBtn">暂停刷新</button>
+            <button class="gray" onclick="clearLog()">清空</button>
+        </div>
+        <pre id="logBox">（等待日志…）</pre>
+    </div>
+    <div class="card">
+        <h2>固件升级（网页 OTA）</h2>
+        <form action="/update" method="post" enctype="multipart/form-data">
+            <input type="file" name="update" accept=".bin">
+            <div class="row"><button class="ota" type="submit">上传固件</button></div>
+        </form>
+        <div class="info">选择 <b>firmware.bin</b> 上传，完成后自动重启。</div>
+    </div>
+    <script>
+        // 当前屏幕状态：尺寸 + 调色板（hex，来自 /settings colors）。
+        // 调色板不再写死黑白/黑白红——任何墨色组合（黑白/黑白红/灰阶…）
+        // 都由固件型号注册表给出，前端只做通用减色；
+        // 灰阶屏的调色板自带灰阶条目，减色后直接上传索引即可，无特殊路径。
+        var W = 104, H = 212;
+        var paletteHex = ['#000000', '#FFFFFF'];
+        var palRGB = [[0, 0, 0], [255, 255, 255]];
+        var grayMode = 0, grayLevels = 0, planeCount = 2;
+        var srcData = null;   // 原始图片像素，切换方法时重处理
+        var methodSel = 'fs';
+
+        function hexToRgb(hex) {
+            return [parseInt(hex.substr(1, 2), 16),
+                    parseInt(hex.substr(3, 2), 16),
+                    parseInt(hex.substr(5, 2), 16)];
+        }
+
+        function post(p) {
+            fetch(p, { method: 'POST' }).then(r => r.text()).then(t => alert(t));
+        }
+
+        function setupCanvas() {
+            var cv = document.getElementById('preview');
+            cv.width = W; cv.height = H;
+            var maxPx = 260;
+            var s = Math.min(maxPx / W, maxPx / H, 4);
+            cv.style.width = Math.round(W * s) + 'px';
+            cv.style.height = Math.round(H * s) + 'px';
+            document.getElementById('sizeNote').textContent =
+                '当前屏幕：' + W + '×' + H + ' px · ' + paletteHex.length + ' 色' +
+                (grayMode !== 0 ? '（含 ' + grayLevels + ' 级灰阶）' : '') +
+                '。预览 = 屏上实际效果。';
+        }
+
+        document.getElementById('file').addEventListener('change', function () {
+            var file = this.files[0]; if (!file) return;
+            var img = new Image();
+            img.onload = function () {
+                var cv = document.getElementById('preview'), ctx = cv.getContext('2d');
+                ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, W, H);
+                var s = Math.min(W / img.width, H / img.height);
+                var w2 = img.width * s, h2 = img.height * s;
+                ctx.drawImage(img, (W - w2) / 2, (H - h2) / 2, w2, h2);
+                // 保存原始像素，供切换处理方法时重新计算
+                srcData = ctx.getImageData(0, 0, W, H).data;
+                reprocess();
+            };
+            img.src = URL.createObjectURL(file);
+        });
+
+        // 通用减色：把像素量化成"调色板索引"（任意颜色数），按所选方法。
+        // FS = Floyd-Steinberg 误差扩散；simple = RGB 最近色。
+        function quantize(data, method) {
+            var n = W * H, K = palRGB.length;
+            var out = new Uint8Array(n);
+            if (method === 'fs') {
+                var R = [], G = [], B = [];
+                for (var y = 0; y < H; y++) {
+                    R[y] = new Float32Array(W); G[y] = new Float32Array(W); B[y] = new Float32Array(W);
+                }
+                for (var y = 0; y < H; y++) for (var x = 0; x < W; x++) {
+                    var i = (y * W + x) * 4;
+                    R[y][x] = data[i]; G[y][x] = data[i + 1]; B[y][x] = data[i + 2];
+                }
+                for (var y = 0; y < H; y++) for (var x = 0; x < W; x++) {
+                    var r = R[y][x], g = G[y][x], b = B[y][x];
+                    var best = 0, bd = Infinity;
+                    for (var k = 0; k < K; k++) {
+                        var dr = r - palRGB[k][0], dg = g - palRGB[k][1], db = b - palRGB[k][2];
+                        var dd = dr * dr + dg * dg + db * db;
+                        if (dd < bd) { bd = dd; best = k; }
+                    }
+                    out[y * W + x] = best;
+                    var er = r - palRGB[best][0], eg = g - palRGB[best][1], eb = b - palRGB[best][2];
+                    if (x + 1 < W) { R[y][x + 1] += er * 7 / 16; G[y][x + 1] += eg * 7 / 16; B[y][x + 1] += eb * 7 / 16; }
+                    if (y + 1 < H) {
+                        if (x > 0) { R[y + 1][x - 1] += er * 3 / 16; G[y + 1][x - 1] += eg * 3 / 16; B[y + 1][x - 1] += eb * 3 / 16; }
+                        R[y + 1][x] += er * 5 / 16; G[y + 1][x] += eg * 5 / 16; B[y + 1][x] += eb * 5 / 16;
+                        if (x + 1 < W) { R[y + 1][x + 1] += er / 16; G[y + 1][x + 1] += eg / 16; B[y + 1][x + 1] += eb / 16; }
+                    }
+                }
+            } else {
+                for (var i = 0; i < n; i++) {
+                    var j = i * 4, r = data[j], g = data[j + 1], b = data[j + 2];
+                    var best = 0, bd = Infinity;
+                    for (var k = 0; k < K; k++) {
+                        var dr = r - palRGB[k][0], dg = g - palRGB[k][1], db = b - palRGB[k][2];
+                        var dd = dr * dr + dg * dg + db * db;
+                        if (dd < bd) { bd = dd; best = k; }
+                    }
+                    out[i] = best;
+                }
+            }
+            return out;
+        }
+
+        function grayOn() {
+            return false;   // 灰阶已并入调色板，无独立开关（保留占位避免引用错误）
+        }
+
+        // 处理：减色为调色板索引（含灰阶屏的灰阶条目），预览实际效果并返回索引。
+        function processImage(data) {
+            var n = W * H;
+            var prev = document.getElementById('preview');
+            var ctx = prev.getContext('2d');
+            var img = ctx.createImageData(W, H);
+            var out = quantize(data, methodSel);
+            for (var i = 0; i < n; i++) {
+                var c = palRGB[out[i]];
+                img.data[i * 4] = c[0]; img.data[i * 4 + 1] = c[1];
+                img.data[i * 4 + 2] = c[2]; img.data[i * 4 + 3] = 255;
+            }
+            ctx.putImageData(img, 0, 0);
+            return out;
+        }
+
+        function reprocess() {
+            methodSel = document.getElementById('methodSel').value;
+            if (srcData) processImage(srcData);
+        }
+
+        function uploadImage() {
+            if (!srcData) { alert('请先选择图片'); return; }
+            // 统一管线：减色为调色板索引（灰阶屏的调色板含灰阶条目）→ POST /image
+            var idx = processImage(srcData);
+            var fd = new FormData();
+            fd.append('image', new Blob([idx], { type: 'application/octet-stream' }), 'img.bin');
+            fetch('/image', { method: 'POST', body: fd }).then(r => r.text()).then(t => alert(t));
+        }
+
+        function saveScreen() {
+            var sel = document.getElementById('screenSel');
+            var fd = new FormData();
+            fd.append('screen', sel.value);
+            fetch('/settings', { method: 'POST', body: fd })
+                .then(r => r.text()).then(t => { alert(t); loadAll(); });
+        }
+
+        function applyModelInfo(m) {
+            var info = '驱动 IC：<b>' + m.driverLabel + '</b><br>' +
+                '分辨率：<b>' + m.width + '×' + m.height + '</b> px。<br>' +
+                '颜色：<b>' + m.colors.length + ' 色</b>（' +
+                m.colors.map(function (c) { return c.hex; }).join(' / ') + '）<br>' +
+                (m.grayMode !== 0
+                    ? '灰阶：<b>软件 ' + m.grayLevels + ' 级</b>'
+                    : '灰阶：<b>无</b>');
+            document.getElementById('modelInfo').innerHTML = info;
+        }
+
+        function loadAll() {
+            fetch('/screenmodels').then(r => r.json()).then(function (list) {
+                var sel = document.getElementById('screenSel');
+                sel.innerHTML = '';
+                list.forEach(function (m) {
+                    var o = document.createElement('option');
+                    o.value = m.id;
+                    o.textContent = m.label + '  (' + m.width + '×' + m.height + ')';
+                    sel.appendChild(o);
+                });
+                sel.onchange = function () {
+                    var m = list.find(function (x) { return x.id === parseInt(sel.value); });
+                    if (m) applyModelInfo(m);
+                };
+                fetch('/settings').then(r => r.json()).then(function (cur) {
+                    W = cur.width; H = cur.height;
+                    paletteHex = cur.colors.map(function (c) { return c.hex; });
+                    palRGB = paletteHex.map(hexToRgb);
+                    grayMode = cur.grayMode; grayLevels = cur.grayLevels; planeCount = cur.planeCount;
+                    setupCanvas();
+                    document.getElementById('screenSel').value = String(cur.screen);
+                    applyModelInfo(cur);
+                    if (srcData) reprocess();
+                });
+            });
+        }
+
+        // ---- 设备日志：轮询 /log 增量拉取（串口诊断的网页镜像） ----
+        var logOn = true, logFrom = 0;
+        function toggleLog() {
+            logOn = !logOn;
+            document.getElementById('logBtn').textContent = logOn ? '暂停刷新' : '继续刷新';
+            if (logOn) pollLog();
+        }
+        function clearLog() {
+            logFrom = 0;
+            document.getElementById('logBox').textContent = '（等待日志…）';
+            fetch('/log?clear=1');
+        }
+        function pollLog() {
+            fetch('/log?from=' + logFrom).then(function (r) {
+                var f = r.headers.get('X-Log-From');
+                if (f) logFrom = parseInt(f, 10);
+                return r.text();
+            }).then(function (t) {
+                if (t) {
+                    var box = document.getElementById('logBox');
+                    if (box.textContent === '（等待日志…）') box.textContent = '';
+                    box.textContent += t;
+                    box.scrollTop = box.scrollHeight;
+                }
+            }).catch(function () { });
+        }
+        setInterval(function () { if (logOn) pollLog(); }, 1000);
+
+        // 初始化
+        loadAll();
+        fetch('/status').then(r => r.json()).then(s => {
+            document.getElementById('ip').textContent = '(' + s.ip + ')';
+            document.getElementById('status').innerHTML =
+                'IP: <b>' + s.ip + '</b> · 运行: ' + s.uptime + 's · 信号: ' +
+                s.rssi + ' dBm · 内存: ' + s.heap + 'B';
+        });
+    </script>
+</body>
+
+</html>

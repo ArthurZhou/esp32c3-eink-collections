@@ -1,0 +1,5 @@
+.pio/
+.vscode/
+
+# Auto-generated from data/index.html by scripts/embed_html.py
+include/webpage.h
